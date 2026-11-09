@@ -28,6 +28,9 @@ type RunConfig struct {
 	OutDir      string
 	DateSubdir  bool
 	Style       Style // 零值 / original 为原始风格
+	// 运行限制：0 表示不限；两者都非 0 时满足任一即自动停止。
+	MaxDuration time.Duration
+	MaxCount    int64
 }
 
 // Stats 是运行时统计。
@@ -44,6 +47,7 @@ type Worker struct {
 	mu      sync.Mutex
 	running bool
 	stopCh  chan struct{}
+	doneCh  chan struct{}
 	seq     int64
 	stats   Stats
 
@@ -76,6 +80,7 @@ func (w *Worker) Start(cfg RunConfig) error {
 	}
 	w.running = true
 	w.stopCh = make(chan struct{})
+	w.doneCh = make(chan struct{})
 	w.stats = Stats{Interval: cfg.Interval}
 	stop := w.stopCh
 	w.mu.Unlock()
@@ -84,6 +89,7 @@ func (w *Worker) Start(cfg RunConfig) error {
 		w.mu.Lock()
 		w.running = false
 		w.mu.Unlock()
+		close(w.doneCh) // 循环未启动，让 WaitStopped 立即返回
 		return fmt.Errorf("创建输出目录失败: %w", err)
 	}
 
@@ -106,25 +112,117 @@ func (w *Worker) Stop() {
 	}
 }
 
+// WaitStopped 等待采集循环真正退出（用于退出前把最后几行日志落盘）。
+// timeout <= 0 时最多等 3 秒，避免大图收尾时长时间卡住进程退出。
+func (w *Worker) WaitStopped(timeout time.Duration) {
+	w.mu.Lock()
+	ch := w.doneCh
+	w.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+	}
+}
+
 func (w *Worker) loop(cfg RunConfig, stop <-chan struct{}) {
+	reason := ""
 	defer func() {
 		w.mu.Lock()
 		w.running = false
+		st := w.stats
 		w.mu.Unlock()
-		w.logf(0, "任务已停止")
+
+		if reason == "" {
+			w.logf(0, "任务已停止")
+		} else {
+			w.logf(0, "任务已停止："+reason)
+		}
+		// 自动停止时也要刷新一次界面，让「开始」按钮恢复可用。
+		if w.onStat != nil {
+			w.onStat(st)
+		}
+		close(w.doneCh)
 	}()
 
+	start := time.Now()
+	var deadline <-chan time.Time
+	if cfg.MaxDuration > 0 {
+		tm := time.NewTimer(cfg.MaxDuration)
+		defer tm.Stop()
+		deadline = tm.C
+	}
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
-	w.generate(cfg) // 启动立刻出第一张，便于确认链路正常
+	// limitHit 返回空串表示未触发限制。张数按「已尝试生成数」计，
+	// 正常情况下与落盘文件数一致；异常时也能保证不会无限重试。
+	limitHit := func() string {
+		if cfg.MaxCount > 0 && w.attempts() >= cfg.MaxCount {
+			return fmt.Sprintf("已达到生成张数上限（%d 张）", cfg.MaxCount)
+		}
+		if cfg.MaxDuration > 0 && time.Since(start) >= cfg.MaxDuration {
+			return fmt.Sprintf("已达到运行时长上限（%s）", formatDurationCN(cfg.MaxDuration))
+		}
+		return ""
+	}
+
 	for {
+		if r := limitHit(); r != "" {
+			reason = r
+			return
+		}
+		w.generate(cfg) // 启动立刻出第一张，便于确认链路正常
+		if r := limitHit(); r != "" {
+			reason = r
+			return
+		}
 		select {
 		case <-stop:
 			return
+		case <-deadline:
+			reason = fmt.Sprintf("已达到运行时长上限（%s）", formatDurationCN(cfg.MaxDuration))
+			return
 		case <-ticker.C:
-			w.generate(cfg)
 		}
+	}
+}
+
+// attempts 返回已尝试生成的张数（含失败）。
+func (w *Worker) attempts() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.seq
+}
+
+// formatDurationCN 把时长转成日志里易读的中文描述。
+func formatDurationCN(d time.Duration) string {
+	if d <= 0 {
+		return "0 秒"
+	}
+	if d < time.Second {
+		return fmt.Sprintf("%d 毫秒", d.Milliseconds())
+	}
+	sec := int64(d / time.Second)
+	switch {
+	case sec < 60:
+		return fmt.Sprintf("%d 秒", sec)
+	case sec < 3600:
+		if sec%60 == 0 {
+			return fmt.Sprintf("%d 分钟", sec/60)
+		}
+		return fmt.Sprintf("%d 分 %d 秒", sec/60, sec%60)
+	default:
+		h, m := sec/3600, (sec%3600)/60
+		if m == 0 {
+			return fmt.Sprintf("%d 小时", h)
+		}
+		return fmt.Sprintf("%d 小时 %d 分钟", h, m)
 	}
 }
 

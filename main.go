@@ -29,6 +29,8 @@ type App struct {
 	edW, edH, edSize     *walk.LineEdit
 	edQuality            *walk.LineEdit
 	edInterval, edPrefix *walk.LineEdit
+	edLimitMin           *walk.LineEdit
+	edLimitCount         *walk.LineEdit
 	edDir                *walk.LineEdit
 	cbFormat             *walk.ComboBox
 	cbStyle              *walk.ComboBox
@@ -36,6 +38,7 @@ type App struct {
 	cbAutoQuality        *walk.CheckBox
 	btnStart, btnStop    *walk.PushButton
 	btnClearLog          *walk.PushButton
+	btnOpenLog           *walk.PushButton
 	lblStat              *walk.Label
 	lblEstimate          *walk.Label
 	teLog                *walk.TextEdit
@@ -44,6 +47,10 @@ type App struct {
 	cfgPath string
 	worker  *Worker
 	logs    *logBuffer
+	logFile *logFile
+	logsDir string
+	// limitCount 只用于状态栏显示当前上限（0=不限）。
+	limitCount int64
 	// styleOverride 非空表示 -style 指定了风格：只影响本次运行，
 	// 写回 config.json 时必须还原成磁盘上原有的 diskStyle。
 	styleOverride string
@@ -63,6 +70,8 @@ func main() {
 	autoStart := flag.Bool("autostart", false, "启动后立即开始生成")
 	once := flag.Bool("once", false, "只生成一张图片后退出（用于自检）")
 	styleFlag := flag.String("style", "", "图片风格 original|minecraft（覆盖 config.json，默认 original）")
+	minutesFlag := flag.Int("minutes", -1, "本次运行时长上限（分钟，0=不限；覆盖 config.json）")
+	countFlag := flag.Int64("count", -1, "本次生成张数上限（0=不限；覆盖 config.json）")
 	flag.Parse()
 
 	exeDir := executableDir()
@@ -70,7 +79,7 @@ func main() {
 		*cfgPath = filepath.Join(exeDir, "config.json")
 	}
 
-	app := &App{cfgPath: *cfgPath, logs: newLogBuffer()}
+	app := &App{cfgPath: *cfgPath, logs: newLogBuffer(), logsDir: filepath.Join(exeDir, "logs")}
 	// 风格解析告警在 GUI 里进运行日志，自检模式直接写终端（无需窗口）。
 	if *once {
 		styleWarnf = func(msg string) { fmt.Fprintln(os.Stderr, "[style]", msg) }
@@ -83,6 +92,12 @@ func main() {
 		app.styleOverride = string(resolveStyle(*styleFlag))
 		app.cfg.Style = app.styleOverride // 仅本次运行生效
 	}
+	if *minutesFlag >= 0 {
+		app.cfg.LimitMinutes = *minutesFlag
+	}
+	if *countFlag >= 0 {
+		app.cfg.LimitCount = *countFlag
+	}
 	app.worker = NewWorker(app.onWorkerLog, app.onWorkerStat)
 
 	if *once {
@@ -94,10 +109,14 @@ func main() {
 		walk.MsgBox(nil, appTitle, "界面创建失败："+err.Error(), walk.MsgBoxIconError)
 		return
 	}
+	app.initLogFile()
 	app.applyConfigToUI()
 	app.fitWindow()
 	app.setRunning(false)
 	app.appendLog(fmt.Sprintf("程序就绪，输出目录：%s", app.cfg.OutDir), 0)
+	if path := app.logFile.Path(); path != "" {
+		app.appendLog("日志文件："+path, 0)
+	}
 
 	stopPump := make(chan struct{})
 	go app.logPump(stopPump)
@@ -109,8 +128,11 @@ func main() {
 	app.mw.Run()
 
 	close(stopPump)
-	app.markClosed()
 	app.worker.Stop()
+	app.worker.WaitStopped(3 * time.Second) // 等采集循环写出最后几行
+	app.drainLogsToFile()                   // 退出前把剩余日志落盘（不碰 UI）
+	app.markClosed()
+	_ = app.logFile.Close()
 }
 
 func executableDir() string {
@@ -168,6 +190,11 @@ func (a *App) buildUI() error {
 					Label{Text: "文件名前缀"},
 					LineEdit{AssignTo: &a.edPrefix, MaxLength: 29, MinSize: Size{Width: 90}},
 
+					Label{Text: "运行时长 (分钟，0=不限)"},
+					LineEdit{AssignTo: &a.edLimitMin, MaxLength: 6, MinSize: Size{Width: 90}},
+					Label{Text: "生成张数 (0=不限)"},
+					LineEdit{AssignTo: &a.edLimitCount, MaxLength: 10, MinSize: Size{Width: 90}},
+
 					Label{Text: "输出目录"},
 					Composite{
 						ColumnSpan: 3,
@@ -187,6 +214,7 @@ func (a *App) buildUI() error {
 					PushButton{AssignTo: &a.btnStart, Text: "开始生成", MinSize: Size{Width: 96}, OnClicked: a.onStart},
 					PushButton{AssignTo: &a.btnStop, Text: "停止", MinSize: Size{Width: 80}, OnClicked: a.onStop},
 					PushButton{AssignTo: &a.btnClearLog, Text: "清空日志", MinSize: Size{Width: 80}, OnClicked: a.onClearLog},
+					PushButton{AssignTo: &a.btnOpenLog, Text: "打开日志", MinSize: Size{Width: 80}, OnClicked: a.onOpenLogs},
 					HSpacer{},
 					Label{AssignTo: &a.lblStat, Text: "就绪"},
 				},
@@ -230,6 +258,8 @@ func (a *App) applyConfigToUI() {
 	a.edQuality.SetText(strconv.Itoa(a.cfg.Quality))
 	a.edInterval.SetText(strconv.Itoa(a.cfg.IntervalMS))
 	a.edPrefix.SetText(a.cfg.Prefix)
+	a.edLimitMin.SetText(strconv.Itoa(a.cfg.LimitMinutes))
+	a.edLimitCount.SetText(strconv.FormatInt(a.cfg.LimitCount, 10))
 	a.edDir.SetText(a.cfg.OutDir)
 	switch normalizeFormat(a.cfg.Format) {
 	case FmtPNG:
@@ -285,6 +315,20 @@ func (a *App) readConfig() (Config, error) {
 	if interval < 10 || interval > 3600000 {
 		return c, fmt.Errorf("生成间隔需在 10 ~ 3600000 毫秒之间")
 	}
+	limitMin, err := a.readInt(a.edLimitMin, "运行时长")
+	if err != nil {
+		return c, err
+	}
+	if limitMin < 0 || limitMin > maxLimitMinutes {
+		return c, fmt.Errorf("运行时长需在 0 ~ %d 分钟之间（0=不限）", maxLimitMinutes)
+	}
+	limitCount, err := a.readInt(a.edLimitCount, "生成张数上限")
+	if err != nil {
+		return c, err
+	}
+	if limitCount < 0 || int64(limitCount) > maxLimitCount {
+		return c, fmt.Errorf("生成张数需在 0 ~ %d 之间（0=不限）", maxLimitCount)
+	}
 	dir := strings.TrimSpace(a.edDir.Text())
 	if dir == "" {
 		return c, fmt.Errorf("输出目录不能为空")
@@ -294,6 +338,7 @@ func (a *App) readConfig() (Config, error) {
 	}
 
 	c.Width, c.Height, c.TargetKB, c.IntervalMS = w, h, kb, interval
+	c.LimitMinutes, c.LimitCount = limitMin, int64(limitCount)
 	c.Quality = quality
 	c.Format = normalizeFormat(a.cbFormat.Text())
 	c.Style = string(resolveStyle(a.cbStyle.Text()))
@@ -408,7 +453,10 @@ func (a *App) onStart() {
 		OutDir:      cfg.OutDir,
 		DateSubdir:  cfg.DateSubdir,
 		Style:       Style(cfg.Style),
+		MaxDuration: time.Duration(cfg.LimitMinutes) * time.Minute,
+		MaxCount:    cfg.LimitCount,
 	}
+	a.limitCount = cfg.LimitCount
 	if err := a.worker.Start(run); err != nil {
 		walk.MsgBox(a.mw, "无法开始", err.Error(), walk.MsgBoxIconWarning)
 		return
@@ -424,6 +472,9 @@ func (a *App) onStart() {
 	}
 	a.appendLog(fmt.Sprintf("开始生成：%dx%d %s%s%s 目标 %dKB 间隔 %dms → %s",
 		cfg.Width, cfg.Height, cfg.Format, q, styleInfo, cfg.TargetKB, cfg.IntervalMS, cfg.OutDir), 0)
+	if cfg.LimitMinutes > 0 || cfg.LimitCount > 0 {
+		a.appendLog("运行限制："+limitText(cfg)+"（满足任一条件即自动停止）", 0)
+	}
 	if cfg.Format == FmtBMP {
 		a.appendLog(fmt.Sprintf("BMP 不带压缩，实际大小由尺寸决定（约 %.0f KB），目标大小仅在大于该值时有效",
 			float64(cfg.Width*cfg.Height)*3/1048576.0), 1)
@@ -443,15 +494,31 @@ func boolCN(v bool) string {
 	return "关"
 }
 
+// limitText 把运行限制拼成日志里的一行描述。
+func limitText(cfg Config) string {
+	var parts []string
+	if cfg.LimitMinutes > 0 {
+		parts = append(parts, "时长 "+formatDurationCN(time.Duration(cfg.LimitMinutes)*time.Minute))
+	}
+	if cfg.LimitCount > 0 {
+		parts = append(parts, fmt.Sprintf("张数 %d", cfg.LimitCount))
+	}
+	if len(parts) == 0 {
+		return "无限制"
+	}
+	return strings.Join(parts, " / ")
+}
+
 func (a *App) onStop() {
 	a.worker.Stop()
 	a.setRunning(false)
 }
 
 func (a *App) onClearLog() {
+	a.flushPending() // 先落盘，避免尚未刷新的日志被一起丢弃
 	a.logs.clear()
 	a.teLog.SetText("")
-	a.appendLog("日志已清空", 0)
+	a.appendLog("日志已清空（仅清空界面显示，文件日志继续保留）", 0)
 	a.flushPending() // 按钮在 UI 线程，可以立即刷新
 }
 
@@ -468,7 +535,15 @@ func (a *App) onBrowse() {
 }
 
 func (a *App) onOpenDir() {
-	dir := strings.TrimSpace(a.edDir.Text())
+	a.openFolder(strings.TrimSpace(a.edDir.Text()))
+}
+
+func (a *App) onOpenLogs() {
+	a.openFolder(a.logsDir)
+}
+
+// openFolder 在资源管理器里打开目录，不存在则先创建。
+func (a *App) openFolder(dir string) {
 	if dir == "" {
 		return
 	}
@@ -521,9 +596,11 @@ func (a *App) startEstimatePump(stop <-chan struct{}) {
 // flushPending 必须在 UI 线程调用：一次写入整批日志，避免高频逐行刷新卡界面。
 func (a *App) flushPending() {
 	batch := a.logs.take()
+	// 文件日志与界面共用同一批：100ms 一次、一次 Flush，不逐行刷盘。
+	a.logFile.writeBatch(batch)
 	text, replace := a.logs.flush(batch)
-	if text == "" {
-		return
+	if text == "" || a.teLog == nil {
+		return // teLog 为 nil 只可能出现在无界面的测试/自检场景
 	}
 	if replace {
 		a.teLog.SetText(text)
@@ -533,7 +610,28 @@ func (a *App) flushPending() {
 	a.scrollLogToEnd()
 }
 
+// initLogFile 打开当天的日志文件；失败时只写界面日志，不影响启动。
+func (a *App) initLogFile() {
+	if a.logsDir == "" {
+		return
+	}
+	lf, err := openLogFile(a.logsDir, time.Now())
+	if err != nil {
+		a.appendLog("日志文件打开失败（继续只显示在界面）："+err.Error(), 1)
+		return
+	}
+	a.logFile = lf
+}
+
+// drainLogsToFile 只把待写日志落盘，不触碰任何 UI 控件（退出时用）。
+func (a *App) drainLogsToFile() {
+	a.logFile.writeBatch(a.logs.take())
+}
+
 func (a *App) scrollLogToEnd() {
+	if a.teLog == nil {
+		return
+	}
 	n := a.teLog.TextLength()
 	a.teLog.SetTextSelection(n, n)
 	a.teLog.ScrollToCaret()
@@ -587,8 +685,12 @@ func (a *App) onWorkerLog(level int, msg string) {
 
 func (a *App) onWorkerStat(s Stats) {
 	a.safeSync(func() {
-		a.lblStat.SetText(fmt.Sprintf("已生成 %d 张 | 失败 %d | 合计 %.1f MB | 单张 %dms",
-			s.Gen, s.Fail, float64(s.Bytes)/1048576.0, s.LastDur.Milliseconds()))
+		text := fmt.Sprintf("已生成 %d 张 | 失败 %d | 合计 %.1f MB | 单张 %dms",
+			s.Gen, s.Fail, float64(s.Bytes)/1048576.0, s.LastDur.Milliseconds())
+		if a.limitCount > 0 {
+			text += fmt.Sprintf(" | 上限 %d 张", a.limitCount)
+		}
+		a.lblStat.SetText(text)
 		if !a.worker.Running() {
 			a.setRunning(false)
 		}

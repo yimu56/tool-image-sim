@@ -11,6 +11,13 @@ import (
 // Quality 时作为内部兜底，保持不变以免影响既有生成结果与回归基线。
 const defaultConfigQuality = 100
 
+// 运行限制的合法上限：7 天 / 10 亿张。上限同时用于界面校验与配置兜底，
+// 避免手改 config.json 时 time.Duration 溢出。
+const (
+	maxLimitMinutes = 7 * 24 * 60
+	maxLimitCount   = int64(1_000_000_000)
+)
+
 // Config 是持久化到 config.json 的界面参数。
 type Config struct {
 	Width       int    `json:"width"`
@@ -26,24 +33,30 @@ type Config struct {
 	DateSubdir  bool   `json:"date_subdir"`
 	Style       string `json:"style"` // original（默认）| minecraft
 
+	// 运行限制：0 表示不限；两者都非 0 时满足任一即自动停止。
+	LimitMinutes int   `json:"limit_minutes"`
+	LimitCount   int64 `json:"limit_count"`
+
 	Comment string `json:"_说明,omitempty"`
 }
 
 func defaultConfig(exeDir string) Config {
 	return Config{
-		Width:       1280,
-		Height:      960,
-		TargetKB:    800,
-		Format:      FmtJPG,
-		Pad:         true,
-		Quality:     defaultConfigQuality,
-		AutoQuality: true,
-		IntervalMS:  1000,
-		Prefix:      "IMG",
-		OutDir:      filepath.Join(exeDir, "output"),
-		DateSubdir:  true,
-		Style:       string(StyleOriginal),
-		Comment:     "style=图片风格(original|minecraft, 默认 original); quality=JPEG质量(1-100); auto_quality=压不到目标时自动降质量; pad_to_target=true 时用图片元数据填充到精确字节数; interval_ms=生成间隔毫秒; target_kb=目标文件大小(KB)",
+		Width:        1280,
+		Height:       960,
+		TargetKB:     800,
+		Format:       FmtJPG,
+		Pad:          true,
+		Quality:      defaultConfigQuality,
+		AutoQuality:  true,
+		IntervalMS:   1000,
+		Prefix:       "IMG",
+		OutDir:       filepath.Join(exeDir, "output"),
+		DateSubdir:   true,
+		Style:        string(StyleOriginal),
+		LimitMinutes: 0,
+		LimitCount:   0,
+		Comment:      "style=图片风格(original|minecraft, 默认 original); quality=JPEG质量(1-100); auto_quality=压不到目标时自动降质量; pad_to_target=true 时用图片元数据填充到精确字节数; interval_ms=生成间隔毫秒; target_kb=目标文件大小(KB); limit_minutes=运行时长上限(分钟, 0=不限); limit_count=生成张数上限(0=不限)",
 	}
 }
 
@@ -93,6 +106,20 @@ func loadConfig(path, exeDir string) Config {
 	}
 	if c.OutDir == "" {
 		c.OutDir = cfg.OutDir
+	}
+	// 运行限制：缺字段的零值即「不限」；负数与超范围值收敛到合法区间，
+	// 避免手改配置文件时 time.Duration 溢出或出现无意义的上限。
+	if c.LimitMinutes < 0 {
+		c.LimitMinutes = 0
+	}
+	if c.LimitMinutes > maxLimitMinutes {
+		c.LimitMinutes = maxLimitMinutes
+	}
+	if c.LimitCount < 0 {
+		c.LimitCount = 0
+	}
+	if c.LimitCount > maxLimitCount {
+		c.LimitCount = maxLimitCount
 	}
 	return c
 }
