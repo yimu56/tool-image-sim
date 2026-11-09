@@ -72,6 +72,8 @@ GUI 基于纯 Go 的原生控件（lxn/walk），编译结果是单个 exe，不
 - **尺寸严格等于设定值**，生成间隔、文件名、种子语义不变，输出仍是合法的 JPG/PNG/BMP。
 - 枚举实现为可扩展注册表（`style.go` 的 `styles` + `styleTransforms`）：新增风格只需加常量、注册一个 `func(*image.RGBA) *image.RGBA`、追加到列表，界面下拉框自动带上新项。
 - **非法值**（如 `style: "pixel"`）一律回退 `original`，并写一条 `[style] 未知图片风格 ... 已回退到默认风格` 日志（GUI 运行日志 / `-once` 终端）。
+- **默认 `original` 下有哪些「看起来不一样」**：`config.json` 多了一个 `style` 字段、`_说明` 文案增加了风格说明；GUI 多了「图片风格」下拉框；`-once` 输出末尾多了 `style=original`。**这些都是配置/界面/日志层面，图片字节、尺寸、生成频率与体积控制完全没有变** —— `original_golden_test.go` 用改造前 8 组固定参数（含默认 1280×960/800KB）的产物 SHA-256 做逐字节回归。
+- 每帧种子本来就是 `纳秒时间戳 XOR 递增序号`，**改造前后每一张图都不同**。要对比改造前后请用同一种子固定参数（如上面的 golden 回归），不要拿两次独立运行的两张图直接比。
 
 ### 风格对文件大小的影响（重要）
 
@@ -124,7 +126,9 @@ GUI 基于纯 Go 的原生控件（lxn/walk），编译结果是单个 exe，不
 imgsim.exe -once -style minecraft -config D:\imgsim\config.json
 ```
 
-GUI 里选择风格后点「开始生成」即写入 `config.json`，下次启动自动回填；`-autostart` 无人值守时会按 `config.json`（或被 `-style` 覆盖）的风格运行。
+GUI 里选择风格后点「开始生成」即按原有机制写入 `config.json`，下次启动自动回填；`-autostart` 无人值守时会按 `config.json`（或被 `-style` 覆盖）的风格运行。
+
+> **默认风格不会被临时试跑改掉**：`-style` 只影响本次运行，即使配合 `-autostart`，写回 `config.json` 时也会还原磁盘上原有的 `style`。只有「在 GUI 里主动改下拉框并点开始」才会持久化。若之前已把默认写成 `minecraft`，把下拉框改回 `original` 再点一次开始，或直接把 `config.json` 的 `style` 改成 `"original"` / 删除该字段即可恢复。
 
 ---
 

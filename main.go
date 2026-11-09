@@ -42,6 +42,10 @@ type App struct {
 	cfgPath string
 	worker  *Worker
 	logs    *logBuffer
+	// styleOverride 非空表示 -style 指定了风格：只影响本次运行，
+	// 写回 config.json 时必须还原成磁盘上原有的 diskStyle。
+	styleOverride string
+	diskStyle     string
 
 	logMu  sync.Mutex
 	closed bool
@@ -68,7 +72,9 @@ func main() {
 	}
 	app.cfg = loadConfig(*cfgPath, exeDir)
 	if *styleFlag != "" {
-		app.cfg.Style = string(resolveStyle(*styleFlag))
+		app.diskStyle = app.cfg.Style // 配置文件里本来的默认值
+		app.styleOverride = string(resolveStyle(*styleFlag))
+		app.cfg.Style = app.styleOverride // 仅本次运行生效
 	}
 	app.worker = NewWorker(app.onWorkerLog, app.onWorkerStat)
 
@@ -300,6 +306,17 @@ func (a *App) readInt(ed *walk.LineEdit, name string) (int, error) {
 
 // ---------- 按钮事件 ----------
 
+// configForPersist 决定写回 config.json 的内容。override 为空时按界面选择
+// 正常持久化；非空（-style 临时覆盖）时必须把 style 还原成磁盘上的旧值，
+// 保证「默认风格」不会被一次命令行试跑或 -autostart 悄悄改写。
+func configForPersist(cfg Config, override, diskStyle string) Config {
+	if override == "" {
+		return cfg
+	}
+	cfg.Style = diskStyle
+	return cfg
+}
+
 func (a *App) onStart() {
 	cfg, err := a.readConfig()
 	if err != nil {
@@ -307,7 +324,9 @@ func (a *App) onStart() {
 		return
 	}
 	a.cfg = cfg
-	if err := saveConfig(a.cfgPath, cfg); err != nil {
+	// -style 只是本次运行的临时覆盖；写回配置时还原磁盘上原有的 style，
+	// 否则「试一次 minecraft」就会把下次启动的默认风格一起改掉。
+	if err := saveConfig(a.cfgPath, configForPersist(cfg, a.styleOverride, a.diskStyle)); err != nil {
 		a.appendLog("保存配置失败："+err.Error(), 1)
 	}
 

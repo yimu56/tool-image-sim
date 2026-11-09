@@ -351,6 +351,45 @@ func TestOriginalPathNeverTransforms(t *testing.T) {
 	}
 }
 
+// -style / -autostart 的临时覆盖绝不能被 saveConfig 写回默认配置，
+// 否则试跑一次 minecraft 后，下次启动的「默认风格」就变了。
+func TestStyleOverrideIsNotPersisted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	base := defaultConfig(dir)
+	if err := saveConfig(path, base); err != nil {
+		t.Fatal(err)
+	}
+
+	disk := loadConfig(path, dir)
+	if disk.Style != string(StyleOriginal) {
+		t.Fatalf("默认配置应为 original，实际 %q", disk.Style)
+	}
+	override := string(resolveStyle("minecraft"))
+	ui := disk
+	ui.Style = override // 界面/本次运行看到的是被覆盖后的风格
+	if ui.Style != string(StyleMinecraft) {
+		t.Fatal("本次运行应使用 minecraft")
+	}
+
+	saved := configForPersist(ui, override, disk.Style)
+	if saved.Style != string(StyleOriginal) {
+		t.Fatalf("临时覆盖不应写入配置文件，实际 %q", saved.Style)
+	}
+	if err := saveConfig(path, saved); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadConfig(path, dir); got.Style != string(StyleOriginal) {
+		t.Fatalf("重新读取配置后默认风格应仍是 original，实际 %q", got.Style)
+	}
+
+	// 没有 -style 时，GUI 里主动选择仍应正常持久化（原有机制）。
+	ui.Style = string(StyleMinecraft)
+	if got := configForPersist(ui, "", disk.Style); got.Style != string(StyleMinecraft) {
+		t.Fatalf("界面主动选择应被保存，实际 %q", got.Style)
+	}
+}
+
 // worker -> Spec 的实际链路：风格能被透传、落盘文件尺寸/体积正确、日志有标记。
 func TestWorkerPassesStyleToBuild(t *testing.T) {
 	dir := t.TempDir()
