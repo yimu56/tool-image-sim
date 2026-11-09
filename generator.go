@@ -68,8 +68,8 @@ func extOf(format string) string {
 }
 
 // Build 按 spec 生成图片字节。核心策略：
-//  1. 用 spec.Quality 指定的 JPEG 质量（PNG/BMP 忽略），对"纹理细节档位"做整数二分，
-//     让编码后的体积逼近目标且不超过目标；
+//  1. 以中点档位为锚做自适应探测，只在必要时在对应区间二分，
+//     用最少的「渲染 + 编码」次数找到体积不超过目标、且尽量接近目标的纹理档位；
 //  2. 若最平滑仍超目标且 AutoQuality=true（仅 JPEG），再对质量二分自动下调；
 //  3. 仍小于目标时，用合法的元数据块（PNG tEXt / JPEG COM）填充到精确字节数，
 //     保证产出的文件既符合图片格式，字节数又严格等于用户设定值。
@@ -97,40 +97,81 @@ func Build(spec Spec) (*Result, error) {
 		return &Result{Data: data, Encoded: len(data), Detail: 0.50, Quality: quality}, nil
 	}
 
-	// 对"纹理档位"整数二分（0~110 对应 amp 0~1），保证一定能降到 0，
-	// 用浮点的话会因为量化精度停在小数上，误判"压不到目标"。
-	lo, hi := 0, 110
+	// 每次档位探测都要全量渲染 + 编码，是整条链路最贵的操作。
+	// 开启精确填充时容差放宽到 10%：缺的字节本来就要靠元数据补齐，
+	// 为最后几个百分点再跑几次全量编码并不划算；不填充时保持 2.5%，
+	// 让实际文件体积尽量贴近设定值。
+	tolerance := target / 40
+	if spec.Pad {
+		tolerance = target / 10
+	}
+	probe := func(level int) ([]byte, error) {
+		img := renderRGBA(spec.Width, spec.Height, float64(level)/110.0, spec.Seed)
+		return encodeIMG(img, format, quality)
+	}
+
 	var best []byte
 	bestDetail, bestQuality := 0.0, quality
+	// accept 记录一次命中，并判断剩余缺口是否已小到可以交给填充
+	accept := func(data []byte, level int) bool {
+		if int64(len(data)) > target {
+			return false
+		}
+		best, bestDetail, bestQuality = data, float64(level)/110.0, quality
+		return target-int64(len(data)) < tolerance
+	}
+
+	// 先用中点 55 探测：一次测量就能区分"目标偏小"（往低档位找）、
+	// "已经够接近"（直接收工）、"还有余量"（往高档位找）三种情况。
+	const pivot = 55
+	d, err := probe(pivot)
+	if err != nil {
+		return nil, err
+	}
+	lo, hi := 0, -1 // 默认无需继续搜索
+	switch {
+	case int64(len(d)) > target:
+		lo, hi = 0, pivot-1
+	case accept(d, pivot):
+		// 一次命中即可，不进入下面的循环
+	default:
+		// 余量还很大，先试最高档；若它也不超目标，就是最优解（等价于二分跑满）
+		top, err := probe(110)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(top)) <= target {
+			best, bestDetail, bestQuality = top, 1, quality
+		} else {
+			best, bestDetail = d, float64(pivot)/110.0
+			lo, hi = pivot+1, 109 // 目标落在中点与最高档之间
+		}
+	}
 
 	for lo <= hi {
 		mid := (lo + hi) / 2
-		amp := float64(mid) / 110.0
-		img := renderRGBA(spec.Width, spec.Height, amp, spec.Seed)
-		data, err := encodeIMG(img, format, quality)
+		data, err := probe(mid)
 		if err != nil {
 			return nil, err
 		}
 		if int64(len(data)) <= target {
-			best, bestDetail, bestQuality = data, amp, quality
-			lo = mid + 1
-			// 已经足够接近目标（误差 < 2.5%），剩余交给填充
-			if target-int64(len(data)) < target/40 {
+			if accept(data, mid) {
 				break
 			}
+			lo = mid + 1
 		} else {
 			hi = mid - 1
 		}
 	}
 
 	if best == nil {
-		// 最平滑仍超目标：仅当允许自动降质量时，JPEG 才有第二级手段
+		// 最平滑画面与质量无关，只渲染一次即可供下面所有质量档位复用
+		flat := renderRGBA(spec.Width, spec.Height, 0, spec.Seed)
 		if format == FmtJPG && spec.AutoQuality {
 			qlo, qhi := 1, quality
 			for i := 0; i < 7 && qlo <= qhi; i++ {
 				mid := (qlo + qhi) / 2
-				img := renderRGBA(spec.Width, spec.Height, 0, spec.Seed)
-				data, err := encodeIMG(img, format, mid)
+				data, err := encodeIMG(flat, format, mid)
 				if err != nil {
 					return nil, err
 				}
@@ -148,8 +189,7 @@ func Build(spec Spec) (*Result, error) {
 			if spec.AutoQuality && format == FmtJPG {
 				q = 1
 			}
-			img := renderRGBA(spec.Width, spec.Height, 0, spec.Seed)
-			data, err := encodeIMG(img, format, q)
+			data, err := encodeIMG(flat, format, q)
 			if err != nil {
 				return nil, err
 			}
@@ -202,55 +242,46 @@ func buildBMP(spec Spec) (*Result, error) {
 
 // noiseGrid 是一个随机值网格，按 smoothstep 双线性插值采样，
 // 用来合成"低频斑块 + 高频起伏"的自然纹理。
+// 每个轴的整数坐标与插值权重只跟坐标有关，预先算成表，
+// 内层逐像素循环里就只剩数组索引和乘加，不再有除法和分支。
 type noiseGrid struct {
 	gw, gh int
-	cell   float64
 	v      []float64
+	x0, y0 []int
+	sx, sy []float64
 }
 
-func newNoiseGrid(w, h, cell int, next func() uint64) *noiseGrid {
-	g := &noiseGrid{
-		gw:   w/cell + 2,
-		gh:   h/cell + 2,
-		cell: float64(cell),
-	}
+func newNoiseGrid(w, h, cell int, s *uint64) *noiseGrid {
+	g := &noiseGrid{gw: w/cell + 2, gh: h/cell + 2}
 	g.v = make([]float64, g.gw*g.gh)
 	for i := range g.v {
-		g.v[i] = float64((next()>>40)&0xFFF) / 4095.0
+		*s ^= *s << 13
+		*s ^= *s >> 7
+		*s ^= *s << 17
+		g.v[i] = float64((*s>>40)&0xFFF) / 4095.0
 	}
+	g.x0, g.sx = axisTable(w, g.gw, float64(cell))
+	g.y0, g.sy = axisTable(h, g.gh, float64(cell))
 	return g
 }
 
-func (g *noiseGrid) sample(x, y int) float64 {
-	gx := float64(x) / g.cell
-	x0 := int(gx)
-	if x0 > g.gw-2 {
-		x0 = g.gw - 2
+func axisTable(n, glen int, cell float64) ([]int, []float64) {
+	i0 := make([]int, n)
+	w := make([]float64, n)
+	for i := 0; i < n; i++ {
+		g := float64(i) / cell
+		x0 := int(g)
+		if x0 > glen-2 {
+			x0 = glen - 2
+		}
+		f := g - float64(x0)
+		if f > 1 {
+			f = 1
+		}
+		i0[i] = x0
+		w[i] = f * f * (3 - 2*f)
 	}
-	fx := gx - float64(x0)
-	if fx > 1 {
-		fx = 1
-	}
-	sx := fx * fx * (3 - 2*fx)
-
-	gy := float64(y) / g.cell
-	y0 := int(gy)
-	if y0 > g.gh-2 {
-		y0 = g.gh - 2
-	}
-	fy := gy - float64(y0)
-	if fy > 1 {
-		fy = 1
-	}
-	sy := fy * fy * (3 - 2*fy)
-
-	rowA := y0 * g.gw
-	rowB := (y0 + 1) * g.gw
-	v00, v10 := g.v[rowA+x0], g.v[rowA+x0+1]
-	v01, v11 := g.v[rowB+x0], g.v[rowB+x0+1]
-	top := v00 + (v10-v00)*sx
-	bot := v01 + (v11-v01)*sx
-	return top + (bot-top)*sy
+	return i0, w
 }
 
 // renderRGBA 生成一张"类相机拍摄"的图：两层随机斑块（模拟光照不均与表面起伏）
@@ -264,15 +295,11 @@ func renderRGBA(w, h int, amp float64, seed int64) *image.RGBA {
 	if s == 0 {
 		s = 0x9E3779B97F4A7C15
 	}
-	next := func() uint64 {
-		s ^= s << 13
-		s ^= s >> 7
-		s ^= s << 17
-		return s
-	}
 
-	coarse := newNoiseGrid(w, h, 48, next) // 大块明暗
-	fine := newNoiseGrid(w, h, 14, next)   // 细节起伏
+	coarse := newNoiseGrid(w, h, 48, &s) // 大块明暗
+	fine := newNoiseGrid(w, h, 14, &s)   // 细节起伏
+	cv, fv := coarse.v, fine.v
+	cgw, fgw := coarse.gw, fine.gw
 	na := int32(amp * 110)
 	// 细节层权重随档位增长：低档位保持平滑（让"小文件"也能生成），高档位纹理丰富
 	fw := 0.06 + 0.34*amp
@@ -280,11 +307,29 @@ func renderRGBA(w, h int, amp float64, seed int64) *image.RGBA {
 
 	for y := 0; y < h; y++ {
 		row := y * stride
+		cA, cB := coarse.y0[y]*cgw, (coarse.y0[y]+1)*cgw
+		fA, fB := fine.y0[y]*fgw, (fine.y0[y]+1)*fgw
+		csy, fsy := coarse.sy[y], fine.sy[y]
 		for x := 0; x < w; x++ {
-			f := coarse.sample(x, y)*cw + fine.sample(x, y)*fw
+			cx := coarse.x0[x]
+			csx := coarse.sx[x]
+			top := cv[cA+cx] + (cv[cA+cx+1]-cv[cA+cx])*csx
+			bot := cv[cB+cx] + (cv[cB+cx+1]-cv[cB+cx])*csx
+			c := top + (bot-top)*csy
+
+			fx := fine.x0[x]
+			fsx := fine.sx[x]
+			top = fv[fA+fx] + (fv[fA+fx+1]-fv[fA+fx])*fsx
+			bot = fv[fB+fx] + (fv[fB+fx+1]-fv[fB+fx])*fsx
+			f := c*cw + (top+(bot-top)*fsy)*fw
+
 			base := int32(25) + int32(f*170)
 
-			r := next()
+			// 随机流就地展开，避免逐像素闭包调用；消耗次数与建网格时一致
+			s ^= s << 13
+			s ^= s >> 7
+			s ^= s << 17
+			r := s
 			n := int32((r>>56)&0xFF) - 128 // -128..127
 			j := n * na / 100              // 亮度噪声，amp=0 时为 0
 			v := base + j
@@ -323,6 +368,7 @@ func encodeIMG(img image.Image, format string, quality int) ([]byte, error) {
 	case FmtPNG:
 		// DefaultCompression：体积明显小于 BestSpeed，编码耗时仍可接受
 		enc := png.Encoder{CompressionLevel: png.DefaultCompression}
+		growEncodeBuffer(&buf, img)
 		if err := enc.Encode(&buf, img); err != nil {
 			return nil, err
 		}
@@ -343,11 +389,29 @@ func encodeIMG(img image.Image, format string, quality int) ([]byte, error) {
 		if quality > 100 {
 			quality = 100
 		}
+		// 压缩后的体积通常不超过像素数，一次把缓冲开够，
+		// 避免编码过程中反复扩容 + 整块拷贝。
+		growEncodeBuffer(&buf, img)
 		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
 			return nil, err
 		}
 	}
 	return buf.Bytes(), nil
+}
+
+func growEncodeBuffer(buf *bytes.Buffer, img image.Image) {
+	b := img.Bounds()
+	n := b.Dx() * b.Dy()
+	if n <= 0 {
+		return
+	}
+	// 极限尺寸（最大 16000x16000）下一字节一像素会一次性申请 256MB，
+	// 封顶 32MB，超大图交给 bytes.Buffer 自己按需扩容。
+	const maxPrealloc = 32 << 20
+	if n > maxPrealloc {
+		n = maxPrealloc
+	}
+	buf.Grow(n)
 }
 
 // encodeBMP 手写 24 位 BMP（无压缩，体积固定）。
