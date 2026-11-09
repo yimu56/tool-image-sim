@@ -29,7 +29,12 @@ type Spec struct {
 	Quality     int  // JPEG 质量 1~100；<=0 视为默认 88；PNG/BMP 忽略
 	AutoQuality bool // 最平滑仍超目标时，是否允许自动下调质量
 	Seed        int64
+	Style       Style // 图片风格；零值或 original 表示原始风格，不做任何后处理
 }
+
+// renderFunc 是「按细节档位渲染原始噪声图」的函数签名。
+// 原始风格下它直接指向 renderRGBA 本身，不经过任何包装。
+type renderFunc func(w, h int, amp float64, seed int64) *image.RGBA
 
 // Result 是生成结果。
 type Result struct {
@@ -39,6 +44,9 @@ type Result struct {
 	Quality int     // JPEG 质量（PNG/BMP 无意义）
 	Padded  bool    // 是否做过填充
 	Note    string
+	Style   Style // 本次实际采用的风格
+	// Transformed 表示是否执行过风格后处理；原始风格恒为 false。
+	Transformed bool
 }
 
 // effectiveQuality 把用户输入收敛到合法 JPEG 质量；未填时用默认值。
@@ -67,13 +75,81 @@ func extOf(format string) string {
 	return strings.ToLower(normalizeFormat(format))
 }
 
-// Build 按 spec 生成图片字节。核心策略：
+// Build 按 spec 生成图片字节。默认风格（Style 零值或 "original"）走完全
+// 未改动的原始链路：渲染函数直接是 renderRGBA 本身，不注册任何后处理，
+// 因此不会调用 Minecraft 转换函数，产物与改造前逐字节一致。
+// 其他风格只在「原始噪声图渲染之后」插入本地转换，档位探测、质量二分、
+// 元数据填充全部基于转换后的编码结果，尺寸与体积语义保持不变。
+func Build(spec Spec) (*Result, error) {
+	style := resolveStyle(string(spec.Style))
+	if style == StyleOriginal {
+		res, err := build(spec, renderRGBA)
+		if err != nil {
+			return nil, err
+		}
+		res.Style = StyleOriginal
+		return res, nil
+	}
+	tf := transformFor(style)
+	if tf == nil {
+		// 预留扩展：枚举存在但没有转换实现时明确回退，不静默产出。
+		styleWarnf(fmt.Sprintf("风格 %q 暂无转换实现，本次回退到 %q", style, StyleOriginal))
+		res, err := build(spec, renderRGBA)
+		if err != nil {
+			return nil, err
+		}
+		res.Style = StyleOriginal
+		return res, nil
+	}
+	render := func(w, h int, amp float64, seed int64) *image.RGBA {
+		return tf(renderRGBA(w, h, amp, seed))
+	}
+	res, err := build(spec, render)
+	if err != nil {
+		return nil, err
+	}
+	res.Style = style
+	res.Transformed = true
+	explainStyleSize(res, style, spec)
+	return res, nil
+}
+
+// explainStyleSize 把风格转换对文件体积的影响写进日志备注：方块化 / 有限调色板
+// 会显著提高压缩率，缺口沿用原有元数据填充补齐，不静默改变「目标大小」语义。
+func explainStyleSize(res *Result, style Style, spec Spec) {
+	if spec.TargetBytes <= 0 {
+		return // 未限制大小，没有体积语义需要说明
+	}
+	padded := len(res.Data) - res.Encoded
+	gap := spec.TargetBytes - int64(len(res.Data))
+	if padded <= 0 && gap <= 0 {
+		return
+	}
+	msg := fmt.Sprintf("风格 %s：方块化后图像数据编码为 %d 字节", style, res.Encoded)
+	switch {
+	case padded > 0 && spec.Pad && res.Padded:
+		msg += fmt.Sprintf("，已用原有元数据填充补齐 %d 字节到目标（尺寸不变）", padded)
+	case gap > 0:
+		msg += fmt.Sprintf("，比目标小 %d 字节，未做填充", gap)
+	default:
+		return
+	}
+	if res.Note == "" {
+		res.Note = msg
+	} else {
+		res.Note = msg + "；" + res.Note
+	}
+}
+
+// build 是原有生成链路，核心策略未改动：
 //  1. 以中点档位为锚做自适应探测，只在必要时在对应区间二分，
 //     用最少的「渲染 + 编码」次数找到体积不超过目标、且尽量接近目标的纹理档位；
 //  2. 若最平滑仍超目标且 AutoQuality=true（仅 JPEG），再对质量二分自动下调；
 //  3. 仍小于目标时，用合法的元数据块（PNG tEXt / JPEG COM）填充到精确字节数，
 //     保证产出的文件既符合图片格式，字节数又严格等于用户设定值。
-func Build(spec Spec) (*Result, error) {
+//
+// render 参数只在非原始风格时包裹一层本地转换；原始风格传入的就是 renderRGBA。
+func build(spec Spec, render renderFunc) (*Result, error) {
 	if spec.Width < 8 || spec.Height < 8 {
 		return nil, fmt.Errorf("尺寸太小：%dx%d（最小 8x8）", spec.Width, spec.Height)
 	}
@@ -84,12 +160,12 @@ func Build(spec Spec) (*Result, error) {
 	quality := effectiveQuality(spec.Quality)
 
 	if format == FmtBMP {
-		return buildBMP(spec)
+		return buildBMP(spec, render)
 	}
 
 	target := spec.TargetBytes
 	if target <= 0 {
-		img := renderRGBA(spec.Width, spec.Height, 0.50, spec.Seed)
+		img := render(spec.Width, spec.Height, 0.50, spec.Seed)
 		data, err := encodeIMG(img, format, quality)
 		if err != nil {
 			return nil, err
@@ -106,7 +182,7 @@ func Build(spec Spec) (*Result, error) {
 		tolerance = target / 10
 	}
 	probe := func(level int) ([]byte, error) {
-		img := renderRGBA(spec.Width, spec.Height, float64(level)/110.0, spec.Seed)
+		img := render(spec.Width, spec.Height, float64(level)/110.0, spec.Seed)
 		return encodeIMG(img, format, quality)
 	}
 
@@ -166,7 +242,7 @@ func Build(spec Spec) (*Result, error) {
 
 	if best == nil {
 		// 最平滑画面与质量无关，只渲染一次即可供下面所有质量档位复用
-		flat := renderRGBA(spec.Width, spec.Height, 0, spec.Seed)
+		flat := render(spec.Width, spec.Height, 0, spec.Seed)
 		if format == FmtJPG && spec.AutoQuality {
 			qlo, qhi := 1, quality
 			for i := 0; i < 7 && qlo <= qhi; i++ {
@@ -222,8 +298,8 @@ func Build(spec Spec) (*Result, error) {
 	return res, nil
 }
 
-func buildBMP(spec Spec) (*Result, error) {
-	img := renderRGBA(spec.Width, spec.Height, 0.55, spec.Seed)
+func buildBMP(spec Spec, render renderFunc) (*Result, error) {
+	img := render(spec.Width, spec.Height, 0.55, spec.Seed)
 	data, err := encodeBMP(img)
 	if err != nil {
 		return nil, err

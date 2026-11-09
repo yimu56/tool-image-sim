@@ -22,6 +22,15 @@ func BenchmarkBuildDefault(b *testing.B) {
 	})
 }
 
+// 风格转换分支：观察后处理相对默认链路的额外开销。
+func BenchmarkBuildMinecraft(b *testing.B) {
+	benchBuild(b, Spec{
+		Width: 1280, Height: 960, TargetBytes: 800 * 1024,
+		Format: FmtJPG, Pad: true, Quality: 88, AutoQuality: true,
+		Style: StyleMinecraft,
+	})
+}
+
 // 目标远大于可编码体积：主要靠元数据填充，二分最容易白跑的场景。
 func BenchmarkBuildFillHeavy(b *testing.B) {
 	benchBuild(b, Spec{

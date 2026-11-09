@@ -27,6 +27,7 @@ type RunConfig struct {
 	Prefix      string
 	OutDir      string
 	DateSubdir  bool
+	Style       Style // 零值 / original 为原始风格
 }
 
 // Stats 是运行时统计。
@@ -144,6 +145,7 @@ func (w *Worker) generate(cfg RunConfig) {
 		Quality:     cfg.Quality,
 		AutoQuality: cfg.AutoQuality,
 		Seed:        frameSeed(start.UnixNano(), seq),
+		Style:       cfg.Style,
 	}
 
 	res, err := Build(spec)
@@ -191,12 +193,17 @@ func (w *Worker) generate(cfg RunConfig) {
 	if normalizeFormat(cfg.Format) == FmtJPG {
 		qualityInfo = fmt.Sprintf("/质量 %d", res.Quality)
 	}
+	// 风格标记只在非原始风格时追加，原始风格的日志文本保持原样。
+	styleTag := ""
+	if res.Transformed {
+		styleTag = fmt.Sprintf(" 风格 %s", res.Style)
+	}
 	// 内容指纹：即便细节档位/文件大小完全一样，也能一眼看出每帧画面不同
 	sum := sha256.Sum256(res.Data)
 	fp := hex.EncodeToString(sum[:4])
-	w.logf(0, fmt.Sprintf("[%d] %s  %.1f KB  耗时 %dms  (细节 %.2f%s)  #%s%s",
+	w.logf(0, fmt.Sprintf("[%d] %s  %.1f KB  耗时 %dms  (细节 %.2f%s%s)  #%s%s",
 		st.Gen, name, float64(len(res.Data))/1024.0, dur.Milliseconds(),
-		res.Detail, qualityInfo, fp, detail))
+		res.Detail, qualityInfo, styleTag, fp, detail))
 
 	if cfg.Interval > 0 && dur > cfg.Interval {
 		w.logf(1, fmt.Sprintf("单张耗时 %dms 超过间隔 %dms，实际频率会低于设定值",

@@ -8,26 +8,27 @@ import (
 
 // Config 是持久化到 config.json 的界面参数。
 type Config struct {
-	Width      int    `json:"width"`
-	Height     int    `json:"height"`
-	TargetKB   int    `json:"target_kb"`
-	Format     string `json:"format"`
-	Pad        bool   `json:"pad_to_target"`
-	Quality    int    `json:"quality"`
-	AutoQuality bool  `json:"auto_quality"`
-	IntervalMS int    `json:"interval_ms"`
-	Prefix     string `json:"prefix"`
-	OutDir     string `json:"out_dir"`
-	DateSubdir bool   `json:"date_subdir"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+	TargetKB    int    `json:"target_kb"`
+	Format      string `json:"format"`
+	Pad         bool   `json:"pad_to_target"`
+	Quality     int    `json:"quality"`
+	AutoQuality bool   `json:"auto_quality"`
+	IntervalMS  int    `json:"interval_ms"`
+	Prefix      string `json:"prefix"`
+	OutDir      string `json:"out_dir"`
+	DateSubdir  bool   `json:"date_subdir"`
+	Style       string `json:"style"` // original（默认）| minecraft
 
 	Comment string `json:"_说明,omitempty"`
 }
 
 func defaultConfig(exeDir string) Config {
 	return Config{
-		Width:      1280,
-		Height:     960,
-		TargetKB:   800,
+		Width:       1280,
+		Height:      960,
+		TargetKB:    800,
 		Format:      FmtJPG,
 		Pad:         true,
 		Quality:     defaultJPEGQuality,
@@ -36,7 +37,8 @@ func defaultConfig(exeDir string) Config {
 		Prefix:      "IMG",
 		OutDir:      filepath.Join(exeDir, "output"),
 		DateSubdir:  true,
-		Comment:     "quality=JPEG质量(1-100); auto_quality=压不到目标时自动降质量; pad_to_target=true 时用图片元数据填充到精确字节数; interval_ms=生成间隔毫秒; target_kb=目标文件大小(KB)",
+		Style:       string(StyleOriginal),
+		Comment:     "style=图片风格(original|minecraft, 默认 original); quality=JPEG质量(1-100); auto_quality=压不到目标时自动降质量; pad_to_target=true 时用图片元数据填充到精确字节数; interval_ms=生成间隔毫秒; target_kb=目标文件大小(KB)",
 	}
 }
 
@@ -78,6 +80,9 @@ func loadConfig(path, exeDir string) Config {
 	if c.Format == "" {
 		c.Format = cfg.Format
 	}
+	// 旧版本配置没有 style 字段：零值按默认 original 处理。
+	// 非法值回退 original，并通过 styleWarnf 输出清晰日志（启动阶段注入）。
+	c.Style = string(resolveStyle(c.Style))
 	if c.Prefix == "" {
 		c.Prefix = cfg.Prefix
 	}

@@ -25,17 +25,18 @@ const (
 type App struct {
 	mw *walk.MainWindow
 
-	edW, edH, edSize       *walk.LineEdit
-	edQuality              *walk.LineEdit
-	edInterval, edPrefix   *walk.LineEdit
-	edDir                  *walk.LineEdit
-	cbFormat               *walk.ComboBox
-	cbPad, cbDate          *walk.CheckBox
-	cbAutoQuality          *walk.CheckBox
-	btnStart, btnStop      *walk.PushButton
-	btnClearLog            *walk.PushButton
-	lblStat                *walk.Label
-	teLog                  *walk.TextEdit
+	edW, edH, edSize     *walk.LineEdit
+	edQuality            *walk.LineEdit
+	edInterval, edPrefix *walk.LineEdit
+	edDir                *walk.LineEdit
+	cbFormat             *walk.ComboBox
+	cbStyle              *walk.ComboBox
+	cbPad, cbDate        *walk.CheckBox
+	cbAutoQuality        *walk.CheckBox
+	btnStart, btnStop    *walk.PushButton
+	btnClearLog          *walk.PushButton
+	lblStat              *walk.Label
+	teLog                *walk.TextEdit
 
 	cfg     Config
 	cfgPath string
@@ -50,6 +51,7 @@ func main() {
 	cfgPath := flag.String("config", "", "配置文件路径（默认 exe 同目录 config.json）")
 	autoStart := flag.Bool("autostart", false, "启动后立即开始生成")
 	once := flag.Bool("once", false, "只生成一张图片后退出（用于自检）")
+	styleFlag := flag.String("style", "", "图片风格 original|minecraft（覆盖 config.json，默认 original）")
 	flag.Parse()
 
 	exeDir := executableDir()
@@ -58,7 +60,16 @@ func main() {
 	}
 
 	app := &App{cfgPath: *cfgPath, logs: newLogBuffer()}
+	// 风格解析告警在 GUI 里进运行日志，自检模式直接写终端（无需窗口）。
+	if *once {
+		styleWarnf = func(msg string) { fmt.Fprintln(os.Stderr, "[style]", msg) }
+	} else {
+		styleWarnf = func(msg string) { app.appendLog("[style] "+msg, 1) }
+	}
 	app.cfg = loadConfig(*cfgPath, exeDir)
+	if *styleFlag != "" {
+		app.cfg.Style = string(resolveStyle(*styleFlag))
+	}
 	app.worker = NewWorker(app.onWorkerLog, app.onWorkerStat)
 
 	if *once {
@@ -117,6 +128,10 @@ func (a *App) buildUI() error {
 					LineEdit{AssignTo: &a.edSize, MaxLength: 7, MinSize: Size{Width: 90}},
 					Label{Text: "图片格式"},
 					ComboBox{AssignTo: &a.cbFormat, Model: []string{FmtJPG, FmtPNG, FmtBMP}, MinSize: Size{Width: 90}},
+
+					Label{Text: "图片风格"},
+					ComboBox{AssignTo: &a.cbStyle, Model: StyleNames(), MinSize: Size{Width: 90}},
+					Label{Text: "minecraft 为本地方块化转换，不联网", ColumnSpan: 2},
 
 					Label{Text: "JPEG 质量 (1-100)"},
 					LineEdit{AssignTo: &a.edQuality, MaxLength: 3, MinSize: Size{Width: 90}},
@@ -206,6 +221,7 @@ func (a *App) applyConfigToUI() {
 	default:
 		a.cbFormat.SetCurrentIndex(0)
 	}
+	a.cbStyle.SetCurrentIndex(indexOfStyle(Style(a.cfg.Style)))
 	a.cbPad.SetChecked(a.cfg.Pad)
 	a.cbDate.SetChecked(a.cfg.DateSubdir)
 	a.cbAutoQuality.SetChecked(a.cfg.AutoQuality)
@@ -261,6 +277,7 @@ func (a *App) readConfig() (Config, error) {
 	c.Width, c.Height, c.TargetKB, c.IntervalMS = w, h, kb, interval
 	c.Quality = quality
 	c.Format = normalizeFormat(a.cbFormat.Text())
+	c.Style = string(resolveStyle(a.cbStyle.Text()))
 	c.Pad = a.cbPad.Checked()
 	c.DateSubdir = a.cbDate.Checked()
 	c.AutoQuality = a.cbAutoQuality.Checked()
@@ -306,6 +323,7 @@ func (a *App) onStart() {
 		Prefix:      cfg.Prefix,
 		OutDir:      cfg.OutDir,
 		DateSubdir:  cfg.DateSubdir,
+		Style:       Style(cfg.Style),
 	}
 	if err := a.worker.Start(run); err != nil {
 		walk.MsgBox(a.mw, "无法开始", err.Error(), walk.MsgBoxIconWarning)
@@ -316,14 +334,21 @@ func (a *App) onStart() {
 	if cfg.Format == FmtJPG {
 		q = fmt.Sprintf(" 质量 %d（自动降质量 %s）", cfg.Quality, boolCN(cfg.AutoQuality))
 	}
-	a.appendLog(fmt.Sprintf("开始生成：%dx%d %s%s 目标 %dKB 间隔 %dms → %s",
-		cfg.Width, cfg.Height, cfg.Format, q, cfg.TargetKB, cfg.IntervalMS, cfg.OutDir), 0)
+	styleInfo := ""
+	if Style(cfg.Style) != StyleOriginal {
+		styleInfo = fmt.Sprintf(" 风格 %s", cfg.Style)
+	}
+	a.appendLog(fmt.Sprintf("开始生成：%dx%d %s%s%s 目标 %dKB 间隔 %dms → %s",
+		cfg.Width, cfg.Height, cfg.Format, q, styleInfo, cfg.TargetKB, cfg.IntervalMS, cfg.OutDir), 0)
 	if cfg.Format == FmtBMP {
 		a.appendLog(fmt.Sprintf("BMP 不带压缩，实际大小由尺寸决定（约 %.0f KB），目标大小仅在大于该值时有效",
 			float64(cfg.Width*cfg.Height)*3/1048576.0), 1)
 	}
 	if cfg.Format != FmtJPG {
 		a.appendLog("当前格式为 "+cfg.Format+"，JPEG 质量参数不生效", 1)
+	}
+	if Style(cfg.Style) != StyleOriginal {
+		a.appendLog(fmt.Sprintf("风格 %s：基于原始随机噪声图做本地转换（无联网 / 无 AI），尺寸、种子与生成间隔不变；方块化会提高压缩率，体积仍按原有档位探测 + 元数据填充逼近目标，缺口见每张图片备注", cfg.Style), 0)
 	}
 }
 
@@ -484,9 +509,9 @@ func (a *App) runOnce() {
 	res, err := Build(Spec{
 		Width: cfg.Width, Height: cfg.Height,
 		TargetBytes: int64(cfg.TargetKB) * 1024,
-		Format: cfg.Format, Pad: cfg.Pad,
+		Format:      cfg.Format, Pad: cfg.Pad,
 		Quality: cfg.Quality, AutoQuality: cfg.AutoQuality,
-		Seed: time.Now().UnixNano(),
+		Seed: time.Now().UnixNano(), Style: Style(cfg.Style),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "生成失败:", err)
@@ -498,6 +523,6 @@ func (a *App) runOnce() {
 		fmt.Fprintln(os.Stderr, "写入失败:", err)
 		return
 	}
-	fmt.Printf("OK %s size=%d target=%d quality=%d note=%s\n",
-		path, len(res.Data), cfg.TargetKB*1024, res.Quality, res.Note)
+	fmt.Printf("OK %s size=%d target=%d quality=%d note=%s style=%s\n",
+		path, len(res.Data), cfg.TargetKB*1024, res.Quality, res.Note, cfg.Style)
 }
