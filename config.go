@@ -6,6 +6,11 @@ import (
 	"path/filepath"
 )
 
+// defaultConfigQuality 是界面与 config.json 的默认 JPEG 质量。
+// 注意与 generator.go 的 defaultJPEGQuality 区分：后者只在 Spec 未指定
+// Quality 时作为内部兜底，保持不变以免影响既有生成结果与回归基线。
+const defaultConfigQuality = 100
+
 // Config 是持久化到 config.json 的界面参数。
 type Config struct {
 	Width       int    `json:"width"`
@@ -31,7 +36,7 @@ func defaultConfig(exeDir string) Config {
 		TargetKB:    800,
 		Format:      FmtJPG,
 		Pad:         true,
-		Quality:     defaultJPEGQuality,
+		Quality:     defaultConfigQuality,
 		AutoQuality: true,
 		IntervalMS:  1000,
 		Prefix:      "IMG",

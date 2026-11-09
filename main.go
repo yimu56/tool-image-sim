@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	appTitle         = "机台图片模拟器 v1.1"
-	logFlushInterval = 100 * time.Millisecond
+	appTitle             = "机台图片模拟器 v1.1"
+	logFlushInterval     = 100 * time.Millisecond
+	estimatePollInterval = 120 * time.Millisecond
 )
 
 type App struct {
@@ -36,6 +37,7 @@ type App struct {
 	btnStart, btnStop    *walk.PushButton
 	btnClearLog          *walk.PushButton
 	lblStat              *walk.Label
+	lblEstimate          *walk.Label
 	teLog                *walk.TextEdit
 
 	cfg     Config
@@ -46,6 +48,11 @@ type App struct {
 	// 写回 config.json 时必须还原成磁盘上原有的 diskStyle。
 	styleOverride string
 	diskStyle     string
+
+	// 预计体积：UI 线程同步计算（等比小采样，约 10~30ms），输入即变。
+	// 参数快照相同则跳过，避免配置回填时重复计算。
+	lastEstimateSpec  EstimateSpec
+	lastEstimateValid bool
 
 	logMu  sync.Mutex
 	closed bool
@@ -94,6 +101,7 @@ func main() {
 
 	stopPump := make(chan struct{})
 	go app.logPump(stopPump)
+	go app.startEstimatePump(stopPump)
 	if *autoStart {
 		app.onStart()
 	}
@@ -126,24 +134,28 @@ func (a *App) buildUI() error {
 				Layout: Grid{Columns: 4, Spacing: 6},
 				Children: []Widget{
 					Label{Text: "宽度 (px)"},
-					LineEdit{AssignTo: &a.edW, MaxLength: 5, MinSize: Size{Width: 90}},
+					LineEdit{AssignTo: &a.edW, MaxLength: 5, MinSize: Size{Width: 90}, OnTextChanged: a.scheduleEstimate},
 					Label{Text: "高度 (px)"},
-					LineEdit{AssignTo: &a.edH, MaxLength: 5, MinSize: Size{Width: 90}},
+					LineEdit{AssignTo: &a.edH, MaxLength: 5, MinSize: Size{Width: 90}, OnTextChanged: a.scheduleEstimate},
 
 					Label{Text: "目标大小 (KB)"},
-					LineEdit{AssignTo: &a.edSize, MaxLength: 7, MinSize: Size{Width: 90}},
+					LineEdit{AssignTo: &a.edSize, MaxLength: 7, MinSize: Size{Width: 90}, OnTextChanged: a.scheduleEstimate},
 					Label{Text: "图片格式"},
-					ComboBox{AssignTo: &a.cbFormat, Model: []string{FmtJPG, FmtPNG, FmtBMP}, MinSize: Size{Width: 90}},
+					ComboBox{AssignTo: &a.cbFormat, Model: []string{FmtJPG, FmtPNG, FmtBMP}, MinSize: Size{Width: 90}, OnCurrentIndexChanged: a.scheduleEstimate},
 
 					Label{Text: "图片风格"},
-					ComboBox{AssignTo: &a.cbStyle, Model: StyleNames(), MinSize: Size{Width: 90}},
+					ComboBox{AssignTo: &a.cbStyle, Model: StyleNames(), MinSize: Size{Width: 90}, OnCurrentIndexChanged: a.scheduleEstimate},
 					Label{Text: "minecraft 为本地方块化转换，不联网", ColumnSpan: 2},
 
 					Label{Text: "JPEG 质量 (1-100)"},
-					LineEdit{AssignTo: &a.edQuality, MaxLength: 3, MinSize: Size{Width: 90}},
-					CheckBox{AssignTo: &a.cbAutoQuality, Text: "压不到目标时自动降质量", ColumnSpan: 2},
+					LineEdit{AssignTo: &a.edQuality, MaxLength: 3, MinSize: Size{Width: 90}, OnTextChanged: a.scheduleEstimate},
+					CheckBox{AssignTo: &a.cbAutoQuality, Text: "压不到目标时自动降质量", ColumnSpan: 2, OnCheckedChanged: a.scheduleEstimate},
 
-					CheckBox{AssignTo: &a.cbPad, Text: "严格填充到目标大小（字节数完全一致）", ColumnSpan: 2},
+					Label{Text: "预计文件大小"},
+					Label{AssignTo: &a.lblEstimate, Text: "计算中…", ColumnSpan: 3},
+					Label{Text: "随分辨率 / 格式 / 质量 / 风格 / 目标大小实时更新；按等比采样跑同一套体积探测逻辑", ColumnSpan: 4},
+
+					CheckBox{AssignTo: &a.cbPad, Text: "严格填充到目标大小（字节数完全一致）", ColumnSpan: 2, OnCheckedChanged: a.scheduleEstimate},
 					CheckBox{AssignTo: &a.cbDate, Text: "按日期建子目录 yyyyMMdd", ColumnSpan: 2},
 				},
 			},
@@ -232,6 +244,7 @@ func (a *App) applyConfigToUI() {
 	a.cbDate.SetChecked(a.cfg.DateSubdir)
 	a.cbAutoQuality.SetChecked(a.cfg.AutoQuality)
 	a.teLog.SetReadOnly(true)
+	a.scheduleEstimate() // 启动时按当前配置先算一次
 }
 
 func (a *App) readConfig() (Config, error) {
@@ -302,6 +315,58 @@ func (a *App) readInt(ed *walk.LineEdit, name string) (int, error) {
 		return 0, fmt.Errorf("%s必须是整数：%s", name, s)
 	}
 	return v, nil
+}
+
+// ---------- 预计文件大小（UI 线程同步计算，输入即变） ----------
+
+// estimateSpecFromUI 在 UI 线程把控件状态拍成一份完整快照。
+func (a *App) estimateSpecFromUI() (EstimateSpec, bool) {
+	if a.edW == nil || a.edH == nil || a.edSize == nil || a.edQuality == nil ||
+		a.cbFormat == nil || a.cbStyle == nil || a.cbPad == nil ||
+		a.cbAutoQuality == nil || a.lblEstimate == nil {
+		return EstimateSpec{}, false // 界面构建早期，控件尚未齐全
+	}
+	w, e1 := strconv.Atoi(strings.TrimSpace(a.edW.Text()))
+	h, e2 := strconv.Atoi(strings.TrimSpace(a.edH.Text()))
+	kb, e3 := strconv.Atoi(strings.TrimSpace(a.edSize.Text()))
+	q, e4 := strconv.Atoi(strings.TrimSpace(a.edQuality.Text()))
+	if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
+		return EstimateSpec{}, false
+	}
+	return EstimateSpec{
+		Width: w, Height: h, Quality: q, TargetKB: kb,
+		Format:      a.cbFormat.Text(),
+		Style:       Style(a.cbStyle.Text()),
+		Pad:         a.cbPad.Checked(),
+		AutoQuality: a.cbAutoQuality.Checked(),
+	}, true
+}
+
+// scheduleEstimate 由任意参数变化事件触发。估算只跑一张等比小采样图
+// （约 10~30ms），因此直接在 UI 线程同步完成并立即刷新 Label：
+// 没有防抖、没有后台线程、没有跨线程同步，参数一变数字就变。
+func (a *App) scheduleEstimate() {
+	if a.lblEstimate == nil {
+		return
+	}
+	spec, valid := a.estimateSpecFromUI()
+	if !valid {
+		a.lastEstimateValid = false
+		_ = a.lblEstimate.SetText("参数不完整")
+		return
+	}
+	// 相同的参数快照不重复计算（配置回填会连续触发多次 TextChanged）。
+	if a.lastEstimateValid && spec == a.lastEstimateSpec {
+		return
+	}
+	a.lastEstimateSpec, a.lastEstimateValid = spec, true
+
+	est, err := EstimateSize(spec)
+	if err != nil {
+		_ = a.lblEstimate.SetText("无法估算：" + err.Error())
+		return
+	}
+	_ = a.lblEstimate.SetText(est.Display())
 }
 
 // ---------- 按钮事件 ----------
@@ -432,6 +497,23 @@ func (a *App) logPump(stop <-chan struct{}) {
 			return
 		case <-tk.C:
 			a.safeSync(a.flushPending)
+		}
+	}
+}
+
+// startEstimatePump 是预计大小「实时变化」的可靠路径。
+// lxn/walk 在 GroupBox 内不转发 EN_CHANGE，LineEdit.OnTextChanged 可能永远
+// 不触发；因此由定时器在 UI 线程（Synchronize）比对参数快照，变了就重算。
+// scheduleEstimate 自带相同快照缓存，未变化时几乎零开销。
+func (a *App) startEstimatePump(stop <-chan struct{}) {
+	tk := time.NewTicker(estimatePollInterval)
+	defer tk.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tk.C:
+			a.safeSync(a.scheduleEstimate)
 		}
 	}
 }

@@ -16,6 +16,8 @@ const (
 	FmtPNG = "PNG"
 	FmtBMP = "BMP"
 
+	// defaultJPEGQuality 是 Spec.Quality 未指定时的内部兜底，不是界面默认值
+	// （界面默认值见 config.go 的 defaultConfigQuality）。
 	defaultJPEGQuality = 88
 )
 
