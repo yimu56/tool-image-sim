@@ -18,9 +18,8 @@ import (
 )
 
 const (
-	appTitle             = "机台图片模拟器 v1.1"
-	logFlushInterval     = 100 * time.Millisecond
-	estimatePollInterval = 120 * time.Millisecond
+	appTitle         = "机台图片模拟器 v1.1"
+	logFlushInterval = 100 * time.Millisecond
 )
 
 type App struct {
@@ -41,6 +40,7 @@ type App struct {
 	btnOpenLog           *walk.PushButton
 	lblStat              *walk.Label
 	lblEstimate          *walk.Label
+	lblNatural           *walk.Label
 	teLog                *walk.TextEdit
 
 	cfg     Config
@@ -51,6 +51,9 @@ type App struct {
 	logsDir string
 	// limitCount 只用于状态栏显示当前上限（0=不限）。
 	limitCount int64
+	// round 是「第几轮生成」：每次成功点击开始生成 +1，只在进程内存里累计，
+	// 不写 config.json，重启程序后归零（新一轮从 001 开始）。
+	round int
 	// styleOverride 非空表示 -style 指定了风格：只影响本次运行，
 	// 写回 config.json 时必须还原成磁盘上原有的 diskStyle。
 	styleOverride string
@@ -60,6 +63,12 @@ type App struct {
 	// 参数快照相同则跳过，避免配置回填时重复计算。
 	lastEstimateSpec  EstimateSpec
 	lastEstimateValid bool
+
+	// 状态栏：worker 回调只写快照，界面更新统一由 100ms 泵在 UI 线程完成，
+	// 避免高频生成时多个 goroutine 争抢 Synchronize 消息队列。
+	statMu    sync.Mutex
+	statDirty bool
+	lastStats Stats
 
 	logMu  sync.Mutex
 	closed bool
@@ -119,8 +128,11 @@ func main() {
 	}
 
 	stopPump := make(chan struct{})
-	go app.logPump(stopPump)
-	go app.startEstimatePump(stopPump)
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		app.logPump(stopPump)
+	}()
 	if *autoStart {
 		app.onStart()
 	}
@@ -128,6 +140,7 @@ func main() {
 	app.mw.Run()
 
 	close(stopPump)
+	<-pumpDone // 等后台刷盘泵退出，避免与 logFile.Close 竞态丢日志
 	app.worker.Stop()
 	app.worker.WaitStopped(3 * time.Second) // 等采集循环写出最后几行
 	app.drainLogsToFile()                   // 退出前把剩余日志落盘（不碰 UI）
@@ -175,7 +188,9 @@ func (a *App) buildUI() error {
 
 					Label{Text: "预计文件大小"},
 					Label{AssignTo: &a.lblEstimate, Text: "计算中…", ColumnSpan: 3},
-					Label{Text: "随分辨率 / 格式 / 质量 / 风格 / 目标大小实时更新；按等比采样跑同一套体积探测逻辑", ColumnSpan: 4},
+					Label{Text: "满细节自然体积"},
+					Label{AssignTo: &a.lblNatural, Text: "计算中…", ColumnSpan: 3},
+					Label{Text: "图像数据受目标大小约束会自动降细节档位；满细节自然体积随分辨率变化", ColumnSpan: 4},
 
 					CheckBox{AssignTo: &a.cbPad, Text: "严格填充到目标大小（字节数完全一致）", ColumnSpan: 2, OnCheckedChanged: a.scheduleEstimate},
 					CheckBox{AssignTo: &a.cbDate, Text: "按日期建子目录 yyyyMMdd", ColumnSpan: 2},
@@ -239,7 +254,7 @@ func (a *App) fitWindow() {
 	sw := int(win.GetSystemMetrics(win.SM_CXSCREEN))
 	sh := int(win.GetSystemMetrics(win.SM_CYSCREEN))
 
-	w, h := 780, 700 // 逻辑尺寸
+	w, h := 780, 720 // 逻辑尺寸
 	if maxW := sw*96/dpi - 32; w > maxW && maxW > 400 {
 		w = maxW
 	}
@@ -387,8 +402,8 @@ func (a *App) estimateSpecFromUI() (EstimateSpec, bool) {
 	}, true
 }
 
-// scheduleEstimate 由任意参数变化事件触发。估算只跑一张等比小采样图
-// （约 10~30ms），因此直接在 UI 线程同步完成并立即刷新 Label：
+// scheduleEstimate 由参数变化事件与 100ms UI 泵共同触发。估算只跑一张等比
+// 小采样图（约 20~60ms），因此直接在 UI 线程同步完成并立即刷新 Label：
 // 没有防抖、没有后台线程、没有跨线程同步，参数一变数字就变。
 func (a *App) scheduleEstimate() {
 	if a.lblEstimate == nil {
@@ -398,6 +413,7 @@ func (a *App) scheduleEstimate() {
 	if !valid {
 		a.lastEstimateValid = false
 		_ = a.lblEstimate.SetText("参数不完整")
+		a.setNaturalText("参数不完整")
 		return
 	}
 	// 相同的参数快照不重复计算（配置回填会连续触发多次 TextChanged）。
@@ -409,9 +425,17 @@ func (a *App) scheduleEstimate() {
 	est, err := EstimateSize(spec)
 	if err != nil {
 		_ = a.lblEstimate.SetText("无法估算：" + err.Error())
+		a.setNaturalText("—")
 		return
 	}
 	_ = a.lblEstimate.SetText(est.Display())
+	a.setNaturalText(est.NaturalDisplay())
+}
+
+func (a *App) setNaturalText(s string) {
+	if a.lblNatural != nil {
+		_ = a.lblNatural.SetText(s)
+	}
 }
 
 // ---------- 按钮事件 ----------
@@ -440,6 +464,7 @@ func (a *App) onStart() {
 		a.appendLog("保存配置失败："+err.Error(), 1)
 	}
 
+	round := a.round + 1
 	run := RunConfig{
 		Width:       cfg.Width,
 		Height:      cfg.Height,
@@ -453,6 +478,7 @@ func (a *App) onStart() {
 		OutDir:      cfg.OutDir,
 		DateSubdir:  cfg.DateSubdir,
 		Style:       Style(cfg.Style),
+		Round:       round,
 		MaxDuration: time.Duration(cfg.LimitMinutes) * time.Minute,
 		MaxCount:    cfg.LimitCount,
 	}
@@ -461,6 +487,7 @@ func (a *App) onStart() {
 		walk.MsgBox(a.mw, "无法开始", err.Error(), walk.MsgBoxIconWarning)
 		return
 	}
+	a.round = round // 启动失败不消耗轮数；轮数只存在于本次进程
 	a.setRunning(true)
 	q := ""
 	if cfg.Format == FmtJPG {
@@ -470,10 +497,10 @@ func (a *App) onStart() {
 	if Style(cfg.Style) != StyleOriginal {
 		styleInfo = fmt.Sprintf(" 风格 %s", cfg.Style)
 	}
-	a.appendLog(fmt.Sprintf("开始生成：%dx%d %s%s%s 目标 %dKB 间隔 %dms → %s",
-		cfg.Width, cfg.Height, cfg.Format, q, styleInfo, cfg.TargetKB, cfg.IntervalMS, cfg.OutDir), 0)
+	a.appendLog(fmt.Sprintf("第 %d 轮开始生成：%dx%d %s%s%s 目标 %dKB 间隔 %dms → %s",
+		round, cfg.Width, cfg.Height, cfg.Format, q, styleInfo, cfg.TargetKB, cfg.IntervalMS, cfg.OutDir), 0)
 	if cfg.LimitMinutes > 0 || cfg.LimitCount > 0 {
-		a.appendLog("运行限制："+limitText(cfg)+"（满足任一条件即自动停止）", 0)
+		a.appendLog("运行限制："+limitText(cfg)+"（满足任一条件即自动停止，每轮从 0 重新计数）", 0)
 	}
 	if cfg.Format == FmtBMP {
 		a.appendLog(fmt.Sprintf("BMP 不带压缩，实际大小由尺寸决定（约 %.0f KB），目标大小仅在大于该值时有效",
@@ -557,12 +584,18 @@ func (a *App) openFolder(dir string) {
 }
 
 func (a *App) setRunning(running bool) {
+	if a.btnStart == nil || a.btnStop == nil {
+		return
+	}
 	a.btnStart.SetEnabled(!running)
 	a.btnStop.SetEnabled(running)
 }
 
-// ---------- 日志：worker 入队，UI 批量刷新 ----------
+// ---------- 日志：后台落盘，UI 线程批量刷新 ----------
 
+// logPump 是唯一的界面刷新泵：磁盘 IO 留在后台 goroutine，所有 UI 更新
+// （日志、预计大小、状态栏）收敛到一次 Synchronize，避免多个 goroutine
+// 争抢 UI 消息队列、以及队列积压后连续多次重绘造成的周期性卡顿。
 func (a *App) logPump(stop <-chan struct{}) {
 	tk := time.NewTicker(logFlushInterval)
 	defer tk.Stop()
@@ -571,43 +604,47 @@ func (a *App) logPump(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-tk.C:
-			a.safeSync(a.flushPending)
+			// 文件日志的磁盘 IO 不占用 UI 消息循环。
+			a.logFile.writeBatch(a.logs.take())
+			a.safeSync(func() {
+				a.flushToUI()
+				a.scheduleEstimate()
+				a.flushStats()
+			})
 		}
 	}
 }
 
-// startEstimatePump 是预计大小「实时变化」的可靠路径。
-// lxn/walk 在 GroupBox 内不转发 EN_CHANGE，LineEdit.OnTextChanged 可能永远
-// 不触发；因此由定时器在 UI 线程（Synchronize）比对参数快照，变了就重算。
-// scheduleEstimate 自带相同快照缓存，未变化时几乎零开销。
-func (a *App) startEstimatePump(stop <-chan struct{}) {
-	tk := time.NewTicker(estimatePollInterval)
-	defer tk.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-tk.C:
-			a.safeSync(a.scheduleEstimate)
-		}
+// flushToUI 只刷新界面控件，磁盘 IO 已由后台 logPump 完成。
+// 一次取走全部待刷批次合并成一次写入：即使 UI 线程曾被占用而积压，恢复后
+// 也只做一次 TextEdit 更新，不会连续触发多次重绘。
+func (a *App) flushToUI() {
+	batch := a.logs.takeUI()
+	if len(batch) == 0 {
+		return
 	}
-}
-
-// flushPending 必须在 UI 线程调用：一次写入整批日志，避免高频逐行刷新卡界面。
-func (a *App) flushPending() {
-	batch := a.logs.take()
-	// 文件日志与界面共用同一批：100ms 一次、一次 Flush，不逐行刷盘。
-	a.logFile.writeBatch(batch)
 	text, replace := a.logs.flush(batch)
 	if text == "" || a.teLog == nil {
 		return // teLog 为 nil 只可能出现在无界面的测试/自检场景
 	}
 	if replace {
-		a.teLog.SetText(text)
+		// 截断需要整体重建文本，期间关掉重绘，避免 RichEdit 反复重排重绘。
+		a.teLog.SendMessage(win.WM_SETREDRAW, 0, 0)
+		_ = a.teLog.SetText(text)
+		a.teLog.SendMessage(win.WM_SETREDRAW, 1, 0)
+		_ = a.teLog.Invalidate()
 	} else {
 		a.teLog.AppendText(text)
 	}
 	a.scrollLogToEnd()
+}
+
+// flushPending 是 UI 线程/按钮/测试用的兼容入口：落盘 + 刷界面。
+// 生产运行时磁盘落盘已由 logPump 在后台完成，这里取到的文件队列一般为空。
+func (a *App) flushPending() {
+	a.logFile.writeBatch(a.logs.take())
+	a.flushToUI()
+	a.flushStats()
 }
 
 // initLogFile 打开当天的日志文件；失败时只写界面日志，不影响启动。
@@ -683,18 +720,32 @@ func (a *App) onWorkerLog(level int, msg string) {
 	a.appendLog(msg, level)
 }
 
+// onWorkerStat 只记录快照，不投递 UI 消息；界面更新统一由 100ms 泵完成。
 func (a *App) onWorkerStat(s Stats) {
-	a.safeSync(func() {
-		text := fmt.Sprintf("已生成 %d 张 | 失败 %d | 合计 %.1f MB | 单张 %dms",
-			s.Gen, s.Fail, float64(s.Bytes)/1048576.0, s.LastDur.Milliseconds())
-		if a.limitCount > 0 {
-			text += fmt.Sprintf(" | 上限 %d 张", a.limitCount)
-		}
-		a.lblStat.SetText(text)
-		if !a.worker.Running() {
-			a.setRunning(false)
-		}
-	})
+	a.statMu.Lock()
+	a.lastStats, a.statDirty = s, true
+	a.statMu.Unlock()
+}
+
+// flushStats 必须在 UI 线程调用：把最新统计一次性写到状态栏，并在任务
+// 自动结束时恢复「开始」按钮。
+func (a *App) flushStats() {
+	a.statMu.Lock()
+	dirty, s := a.statDirty, a.lastStats
+	a.statDirty = false
+	a.statMu.Unlock()
+	if !dirty || a.lblStat == nil {
+		return
+	}
+	text := fmt.Sprintf("已生成 %d 张 | 失败 %d | 合计 %.1f MB | 单张 %dms",
+		s.Gen, s.Fail, float64(s.Bytes)/1048576.0, s.LastDur.Milliseconds())
+	if a.limitCount > 0 {
+		text += fmt.Sprintf(" | 上限 %d 张", a.limitCount)
+	}
+	_ = a.lblStat.SetText(text)
+	if a.worker != nil && !a.worker.Running() {
+		a.setRunning(false)
+	}
 }
 
 // ---------- 自检模式 ----------
@@ -720,8 +771,9 @@ func (a *App) runOnce() {
 		fmt.Fprintln(os.Stderr, "生成失败:", err)
 		return
 	}
-	path := filepath.Join(dir, fmt.Sprintf("%s_%s_000001.%s",
-		sanitizePrefix(cfg.Prefix), time.Now().Format("20060102_150405.000"), extOf(cfg.Format)))
+	// 自检只有一张：轮数 001、本轮序号 000001，与 GUI 命名格式保持一致。
+	path := filepath.Join(dir, fmt.Sprintf("%s_%s_%03d_%06d.%s",
+		sanitizePrefix(cfg.Prefix), time.Now().Format("20060102_150405.000"), 1, 1, extOf(cfg.Format)))
 	if err := os.WriteFile(path, res.Data, 0o644); err != nil {
 		fmt.Fprintln(os.Stderr, "写入失败:", err)
 		return

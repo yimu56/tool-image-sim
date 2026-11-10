@@ -30,9 +30,10 @@ type EstimateSpec struct {
 // SizeEstimate 是一个确定的单值预测（不再是区间）：
 // ImageBytes 是图像数据编码体积，FileBytes 是最终落盘文件字节数。
 type SizeEstimate struct {
-	ImageBytes   int64 // 编码后、未填充的图像数据体积
+	ImageBytes   int64 // 编码后、未填充的图像数据体积（受目标大小钳制）
 	FileBytes    int64 // 预计最终文件字节数
 	PaddedBytes  int64 // 元数据填充量
+	NaturalBytes int64 // 满细节自然体积：不受目标大小钳制，只随分辨率/格式/质量/风格变化
 	BelowMinimum bool  // 目标低于该尺寸可编码下限，无法精确命中
 	BMPFixed     bool  // BMP 无压缩，体积由尺寸锁定
 	Extrapolated bool  // 由缩小采样按面积还原
@@ -59,7 +60,7 @@ func estimateSize(spec EstimateSpec, sampleLimit int64) (SizeEstimate, error) {
 	if format == FmtBMP {
 		rowSize := (spec.Width*3 + 3) &^ 3
 		n := int64(54 + rowSize*spec.Height)
-		est := SizeEstimate{ImageBytes: n, FileBytes: n, BMPFixed: true}
+		est := SizeEstimate{ImageBytes: n, FileBytes: n, NaturalBytes: n, BMPFixed: true}
 		// BMP 的填充只是在像素数据后补零，同样受目标大小约束。
 		if spec.Pad && target > n {
 			est.FileBytes = target
@@ -108,9 +109,23 @@ func estimateSize(spec EstimateSpec, sampleLimit int64) (SizeEstimate, error) {
 	// 不能用 res.Note 判断：非 original 风格会写体积说明备注。
 	belowMinimum := scaledTarget > 0 && int64(res.Encoded) > scaledTarget
 
+	// 额外算一次「满细节自然体积」：固定最高纹理档位、不做任何目标钳制，
+	// 只由分辨率/格式/质量/风格决定。Build 的档位探测为了命中目标会主动
+	// 降细节，导致 ImageBytes 在大分辨率下也被压到目标附近；这一项用来
+	// 直观呈现分辨率本身对图像数据量的影响。
+	natural, err := naturalEncoded(format, st, spec.Quality, sw, sh)
+	if err != nil {
+		return SizeEstimate{}, err
+	}
+	naturalBytes := int64(math.Round(float64(natural) * ratio))
+	if naturalBytes < int64(natural) {
+		naturalBytes = int64(natural)
+	}
+
 	est := SizeEstimate{
 		ImageBytes:   imageBytes,
 		FileBytes:    imageBytes,
+		NaturalBytes: naturalBytes,
 		BelowMinimum: belowMinimum,
 		Extrapolated: sw != spec.Width || sh != spec.Height,
 	}
@@ -119,6 +134,21 @@ func estimateSize(spec EstimateSpec, sampleLimit int64) (SizeEstimate, error) {
 		est.PaddedBytes = target - imageBytes
 	}
 	return est, nil
+}
+
+// naturalEncoded 在采样图上以满细节档位（amp=1.0）渲染并编码一次，返回编码
+// 字节数。它只读取长度、不写文件、不参与档位探测，因此不会改变 Build 的
+// 预测口径，也不会扰动任何真实生成的随机状态。
+func naturalEncoded(format string, style Style, quality, w, h int) (int, error) {
+	img := renderRGBA(w, h, 1.0, estimateSeed)
+	if tf := transformFor(style); tf != nil {
+		img = tf(img)
+	}
+	data, err := encodeIMG(img, normalizeFormat(format), effectiveQuality(quality))
+	if err != nil {
+		return 0, err
+	}
+	return len(data), nil
 }
 
 // estimateSampleSize 把大尺寸等比收敛到估算采样上限内，保留宽高比。
@@ -168,4 +198,20 @@ func (e SizeEstimate) Display() string {
 		s += "；目标低于可编码下限，无法精确命中"
 	}
 	return s
+}
+
+// NaturalDisplay 返回「满细节自然体积」这一行的文案。该值不受目标大小
+// 钳制，因此能直观看出分辨率变化带来的差异。
+func (e SizeEstimate) NaturalDisplay() string {
+	if e.NaturalBytes <= 0 {
+		return "—"
+	}
+	if e.BMPFixed {
+		return fmt.Sprintf("%s（BMP 无压缩，由尺寸锁定）", formatSize(e.NaturalBytes))
+	}
+	if e.NaturalBytes > e.ImageBytes {
+		return fmt.Sprintf("%s（满细节；图像数据已自动降档至 %s 以命中目标）",
+			formatSize(e.NaturalBytes), formatSize(e.ImageBytes))
+	}
+	return fmt.Sprintf("%s（满细节，未触发自动降档）", formatSize(e.NaturalBytes))
 }

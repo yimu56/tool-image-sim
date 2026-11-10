@@ -6,18 +6,20 @@ import (
 )
 
 const (
-	maxLogLines  = 500 // 超过后触发一次重建，避免 TextEdit 无限增长拖慢界面
-	keepLogLines = 250
+	maxLogLines  = 500 // 界面 TextEdit 最多保留的行数
+	keepLogLines = 120 // 触发截断后保留的行数：越小，单次重建越轻
 	lineBreak    = "\r\n"
 )
 
-// logBuffer 把「任意线程产生日志」与「UI 线程批量刷新」解耦：
-// worker 只做 O(1) 入队，UI 每 100ms 取一次批次，一次 AppendText 写完。
-// 这样既能做到每张图片一行日志不丢，又不会在高频生成时把界面刷卡。
+// logBuffer 把「任意线程产生日志」与「后台落盘 / UI 批量刷新」解耦。
+// push 时同一行分别进入两个独立队列：文件队列由后台 goroutine 消费（磁盘
+// IO 不占 UI 线程），界面队列由 UI 线程一次性取空合并写入（即使 UI 曾经
+// 繁忙而积压，恢复后也只做一次 TextEdit 更新，不会连续重绘造成卡顿）。
 type logBuffer struct {
-	mu      sync.Mutex
-	pending []string
-	lines   []string
+	mu        sync.Mutex
+	pending   []string // 待写文件
+	uiPending []string // 待刷界面
+	lines     []string // 当前界面上的历史行
 }
 
 func newLogBuffer() *logBuffer { return &logBuffer{} }
@@ -27,14 +29,24 @@ func (b *logBuffer) push(line string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.pending = append(b.pending, line)
+	b.uiPending = append(b.uiPending, line)
 }
 
-// take 取出并清空待刷新批次。
+// take 取出并清空「待写文件」批次，供后台 goroutine 落盘。
 func (b *logBuffer) take() []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	batch := b.pending
 	b.pending = nil
+	return batch
+}
+
+// takeUI 取出并清空「待刷界面」批次，供 UI 线程合并成一次写入。
+func (b *logBuffer) takeUI() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	batch := b.uiPending
+	b.uiPending = nil
 	return batch
 }
 
@@ -54,11 +66,12 @@ func (b *logBuffer) flush(batch []string) (text string, replace bool) {
 	return strings.Join(batch, lineBreak) + lineBreak, false
 }
 
-// clear 丢弃历史与尚未刷新的日志。
+// clear 丢弃历史与两个队列里尚未刷新的日志。
 func (b *logBuffer) clear() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.pending = nil
+	b.uiPending = nil
 	b.lines = nil
 }
 

@@ -107,6 +107,30 @@ func TestFlushPendingWritesLogFile(t *testing.T) {
 	}
 }
 
+// 后台泵先落盘、界面随后刷新：flushToUI 只碰控件，不得重复写盘，
+// 磁盘 IO 也不会占用 UI 线程。
+func TestFlushToUIDoesNotDuplicateFileWrite(t *testing.T) {
+	dir := t.TempDir()
+	a := &App{logs: newLogBuffer(), logsDir: filepath.Join(dir, "logs")}
+	a.initLogFile()
+	if a.logFile == nil {
+		t.Fatal("应成功打开日志文件")
+	}
+	a.appendLog("只写一次", 0)
+	a.logFile.writeBatch(a.logs.take()) // 模拟后台泵
+	a.flushToUI()                       // UI 刷新不应再写盘
+	a.flushPending()                    // 兼容入口也不应重复写已取走的批次
+	_ = a.logFile.Close()
+
+	raw, err := os.ReadFile(a.logFile.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), "只写一次"); got != 1 {
+		t.Fatalf("日志应只落盘一次，实际 %d 次：%q", got, raw)
+	}
+}
+
 // 端到端：worker 日志 -> App 缓冲 -> 日志文件，含张数上限的停止原因。
 func TestEndToEndLogFileWithCountLimit(t *testing.T) {
 	dir := t.TempDir()

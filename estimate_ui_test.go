@@ -8,7 +8,7 @@ import (
 
 // 回归「预计文件大小随参数实时变化」+「相同参数跳过重算」。
 // lxn/walk 在 GroupBox 内不转发 EN_CHANGE，LineEdit.OnTextChanged 不可靠；
-// 生产里由 startEstimatePump 每 120ms 在 UI 线程调用 scheduleEstimate。
+// 生产里由 logPump 每 100ms 在 UI 线程调用 scheduleEstimate。
 // 测试里没有消息循环，因此直接模拟这一调用，验证参数一变数字立即改变。
 // 无桌面环境下创建窗口会失败，此时跳过（不阻塞纯逻辑测试）。
 //
@@ -35,6 +35,12 @@ func TestEstimateUIRealtimeRefresh(t *testing.T) {
 	base := refresh()
 	if !strings.Contains(base, "预计文件") {
 		t.Fatalf("启动后应立即显示单值预测，实际 %q", base)
+	}
+	if a.lblNatural == nil {
+		t.Fatal("自然体积 Label 未创建")
+	}
+	if !strings.Contains(a.lblNatural.Text(), "满细节") {
+		t.Fatalf("启动后应同时显示满细节自然体积，实际 %q", a.lblNatural.Text())
 	}
 
 	// 相同参数快照应命中缓存，不重复计算。

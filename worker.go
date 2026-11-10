@@ -28,6 +28,9 @@ type RunConfig struct {
 	OutDir      string
 	DateSubdir  bool
 	Style       Style // 零值 / original 为原始风格
+	// Round 是本次运行的轮数：每次成功点击「开始生成」递增，只存在于进程
+	// 内存，不写 config.json，重启程序后从 1 重新开始。用于文件名轮数段与随机种子。
+	Round int
 	// 运行限制：0 表示不限；两者都非 0 时满足任一即自动停止。
 	MaxDuration time.Duration
 	MaxCount    int64
@@ -48,7 +51,7 @@ type Worker struct {
 	running bool
 	stopCh  chan struct{}
 	doneCh  chan struct{}
-	seq     int64
+	seq     int64 // 本轮序号：每次 Start 归零，文件名末尾 6 位与张数上限都按本轮计算
 	stats   Stats
 
 	onLog  func(level int, msg string)
@@ -79,21 +82,26 @@ func (w *Worker) Start(cfg RunConfig) error {
 		return errors.New("任务已在运行")
 	}
 	w.running = true
-	w.stopCh = make(chan struct{})
-	w.doneCh = make(chan struct{})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	w.stopCh = stop
+	w.doneCh = done
 	w.stats = Stats{Interval: cfg.Interval}
-	stop := w.stopCh
+	// 每轮重新计数：张数上限与文件名序号都从 1 开始，不同轮靠 Round 区分。
+	w.seq = 0
 	w.mu.Unlock()
 
 	if err := os.MkdirAll(cfg.OutDir, 0o755); err != nil {
 		w.mu.Lock()
 		w.running = false
 		w.mu.Unlock()
-		close(w.doneCh) // 循环未启动，让 WaitStopped 立即返回
+		close(done) // 循环未启动，让 WaitStopped 立即返回
 		return fmt.Errorf("创建输出目录失败: %w", err)
 	}
 
-	go w.loop(cfg, stop)
+	// done 必须按值传给本轮循环：连续重启时，上一轮的 defer 若直接读
+	// w.doneCh 字段，会误关新一轮的 channel。
+	go w.loop(cfg, stop, done)
 	return nil
 }
 
@@ -130,7 +138,7 @@ func (w *Worker) WaitStopped(timeout time.Duration) {
 	}
 }
 
-func (w *Worker) loop(cfg RunConfig, stop <-chan struct{}) {
+func (w *Worker) loop(cfg RunConfig, stop <-chan struct{}, done chan struct{}) {
 	reason := ""
 	defer func() {
 		w.mu.Lock()
@@ -147,7 +155,7 @@ func (w *Worker) loop(cfg RunConfig, stop <-chan struct{}) {
 		if w.onStat != nil {
 			w.onStat(st)
 		}
-		close(w.doneCh)
+		close(done)
 	}()
 
 	start := time.Now()
@@ -160,8 +168,8 @@ func (w *Worker) loop(cfg RunConfig, stop <-chan struct{}) {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
-	// limitHit 返回空串表示未触发限制。张数按「已尝试生成数」计，
-	// 正常情况下与落盘文件数一致；异常时也能保证不会无限重试。
+	// limitHit 返回空串表示未触发限制。张数按「本轮已尝试生成数」计，
+	// 每轮从 0 重新计数，因此把上限改小后再开始新一轮仍能正常出图。
 	limitHit := func() string {
 		if cfg.MaxCount > 0 && w.attempts() >= cfg.MaxCount {
 			return fmt.Sprintf("已达到生成张数上限（%d 张）", cfg.MaxCount)
@@ -193,7 +201,7 @@ func (w *Worker) loop(cfg RunConfig, stop <-chan struct{}) {
 	}
 }
 
-// attempts 返回已尝试生成的张数（含失败）。
+// attempts 返回本轮已尝试生成的张数（含失败）。
 func (w *Worker) attempts() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -242,7 +250,7 @@ func (w *Worker) generate(cfg RunConfig) {
 		Pad:         cfg.Pad,
 		Quality:     cfg.Quality,
 		AutoQuality: cfg.AutoQuality,
-		Seed:        frameSeed(start.UnixNano(), seq),
+		Seed:        frameSeed(start.UnixNano(), seq, int64(cfg.Round)),
 		Style:       cfg.Style,
 	}
 
@@ -257,8 +265,10 @@ func (w *Worker) generate(cfg RunConfig) {
 	if cfg.DateSubdir {
 		dir = filepath.Join(dir, start.Format("20060102"))
 	}
-	name := fmt.Sprintf("%s_%s_%06d.%s",
-		sanitizePrefix(cfg.Prefix), start.Format("20060102_150405.000"), seq, extOf(cfg.Format))
+	// 命名：前缀_毫秒时间戳_轮数(3位)_本轮序号(6位).扩展名
+	name := fmt.Sprintf("%s_%s_%03d_%06d.%s",
+		sanitizePrefix(cfg.Prefix), start.Format("20060102_150405.000"),
+		cfg.Round, seq, extOf(cfg.Format))
 	path := filepath.Join(dir, name)
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -328,10 +338,16 @@ func (w *Worker) logf(level int, msg string) {
 	}
 }
 
-// frameSeed 把「纳秒时间戳」和「递增序号」混合成每帧唯一的随机种子。
-// 只依赖时间戳会在极高频/时钟回拨时碰撞，加入黄金比例乘法后即使同一纳秒也不同。
-func frameSeed(unixNano int64, seq int64) int64 {
-	return int64(uint64(unixNano) ^ (uint64(seq) * 0x9E3779B97F4A7C15))
+// frameSeed 把「纳秒时间戳」「本轮序号」「轮数」混合成每帧唯一的随机种子。
+// 序号每轮从 1 重新开始，因此额外混入轮数，保证跨轮同序号也不会共用种子。
+// 变参形式兼容只传两个参数的既有调用与回归测试。
+func frameSeed(unixNano int64, seq int64, round ...int64) int64 {
+	r := int64(0)
+	if len(round) > 0 {
+		r = round[0]
+	}
+	return int64(uint64(unixNano) ^ (uint64(seq) * 0x9E3779B97F4A7C15) ^
+		(uint64(r) * 0xC2B2AE3D27D4EB4F))
 }
 
 // sanitizePrefix 去掉文件名非法字符，避免写盘失败。
