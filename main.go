@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	appTitle         = "机台图片模拟器 v1.1"
+	appTitle         = "机台图片模拟器 v1.2.0"
 	logFlushInterval = 100 * time.Millisecond
 )
 
